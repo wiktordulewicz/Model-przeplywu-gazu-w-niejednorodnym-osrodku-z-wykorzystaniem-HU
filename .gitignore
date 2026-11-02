@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Edytor
+.vscode/
+.idea/
+
+# Pliki pracy dyplomowej i wyniki - nie publikować
+*.docx
+*.doc
+*.xlsx
+*.xls
+*.pdf
+~$*
+*.tmp
+wyniki_badania_hu.csv
+zloze_jednofacjalne.csv
+zloze_wielofacjalne.csv
+zloze_realistyczne.csv
+zloze_weglanowe.csv
