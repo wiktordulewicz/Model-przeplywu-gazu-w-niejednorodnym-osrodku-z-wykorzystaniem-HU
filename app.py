@@ -4,13 +4,14 @@ app.py - interfejs użytkownika symulatora (Streamlit).
 Zasada podziału odpowiedzialności: ten plik wyłącznie zbiera parametry,
 wywołuje warstwę obliczeniową i prezentuje wyniki. Cała fizyka i statystyka
 znajduje się w modułach pvt.py, statyka.py i symulator_fvm.py, które nie
-zależą od Streamlita i dają się uruchomić ze skryptu (patrz testy.py).
+zależą od Streamlita i dają się uruchomić także ze zwykłego skryptu.
 
 Uruchomienie:  streamlit run app.py
 """
 import base64
 from pathlib import Path
 import io
+import json
 import uuid
 from dataclasses import dataclass, asdict
 
@@ -19,6 +20,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from statyka import (ModelStatycznyZloza, formatuj_osie_pl, sym, liczba_pl,
                      BLOKADA_RYSOWANIA)
@@ -76,6 +78,167 @@ def pokaz_rysunek(klucz, rysuj, opis="Wykres", dpi=150, wersja=None, max_szeroko
     if klucz not in pamiec or pamiec[klucz][0] != wersja:
         pamiec[klucz] = (wersja, rysunek_png(rysuj, dpi, przycinaj))
     osadz_png(pamiec[klucz][1], opis, max_szerokosc)
+
+
+# ------------------------------------------------------------------ animacja
+def klatki_animacji(s, indeksy, czasy, p_min, p_max, dpi=90):
+    """Klatki PNG mapy ciśnienia dla wybranych zapisów historii.
+
+    Figura budowana jest raz, a w kolejnych klatkach podmieniane są tylko dane
+    obrazu i tytuł, dlatego nawet kilkadziesiąt klatek powstaje w kilka sekund.
+    Skala barw jest wspólna dla całej animacji (p_min, p_max), żeby kolory
+    w różnych klatkach oznaczały to samo ciśnienie.
+    """
+    format_dnia = '.0f' if all(abs(t - round(t)) < 1e-9 for t in czasy) else '.1f'
+    klatki = []
+    with BLOKADA_RYSOWANIA:
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=dpi)
+        obraz = ax.imshow(s.historia_cisnien_3d[indeksy[0]].T, cmap='plasma', origin='lower',
+                          extent=[0, s.nx * s.dx, 0, s.ny * s.dy], vmin=p_min, vmax=p_max)
+        fig.colorbar(obraz, ax=ax, label=r'Ciśnienie złożowe, $p$ [bar]')
+        for otw in s.odwierty:
+            ax.plot((otw['i'] + 0.5) * s.dx, (otw['j'] + 0.5) * s.dy, 'wo', markersize=7,
+                    markeredgecolor='black')
+            ax.annotate(otw['nazwa'], ((otw['i'] + 0.5) * s.dx, (otw['j'] + 0.5) * s.dy),
+                        textcoords="offset points", xytext=(8, 5), color='white', fontsize=9)
+        ax.set_xlabel(r'Współrzędna $x$ [m]')
+        ax.set_ylabel(r'Współrzędna $y$ [m]')
+        tytul = ax.set_title('')
+        formatuj_osie_pl(fig)
+        fig.tight_layout()
+        for indeks, czas in zip(indeksy, czasy):
+            obraz.set_data(s.historia_cisnien_3d[indeks].T)
+            tytul.set_text(f"Rozkład ciśnienia złożowego, dzień {liczba_pl(czas, format_dnia)}")
+            bufor = io.BytesIO()
+            fig.savefig(bufor, format='png', dpi=dpi)
+            klatki.append(bufor.getvalue())
+        plt.close(fig)
+    return klatki
+
+
+def klatki_animacji_3d(s, indeksy, czasy, p_min, p_max, elewacja=30, azymut=-60, dpi=90):
+    """Klatki PNG leja depresyjnego 3D.
+
+    Zakres osi z i skala barw są stałe, więc lej widocznie pogłębia się
+    i rozszerza z upływem czasu, zamiast być za każdym razem przeskalowany.
+    Pionowe linie wskazują położenie odwiertów.
+    """
+    format_dnia = '.0f' if all(abs(t - round(t)) < 1e-9 for t in czasy) else '.1f'
+    x_os = (np.arange(s.nx) + 0.5) * s.dx
+    y_os = (np.arange(s.ny) + 0.5) * s.dy
+    X, Y = np.meshgrid(x_os, y_os)
+    zapas = 0.02 * max(p_max - p_min, 1e-6)
+    z_dol, z_gora = p_min - zapas, p_max + zapas
+    krok = max(1, int(np.ceil(max(s.nx, s.ny) / 60)))      # rzadsza siatka dla dużych złóż
+    klatki = []
+    with BLOKADA_RYSOWANIA:
+        fig = plt.figure(figsize=(7, 5.5), dpi=dpi)
+        ax = fig.add_subplot(111, projection='3d')
+        mapowanie = plt.cm.ScalarMappable(cmap='plasma', norm=plt.Normalize(p_min, p_max))
+        fig.colorbar(mapowanie, ax=ax, shrink=0.6, pad=0.1, label=r'Ciśnienie złożowe, $p$ [bar]')
+        ax.set_xlabel(r'$x$ [m]')
+        ax.set_ylabel(r'$y$ [m]')
+        ax.set_zlabel(r'$p$ [bar]')
+        ax.set_zlim(z_dol, z_gora)
+        ax.view_init(elev=elewacja, azim=azymut)
+        for otw in s.odwierty:
+            xo, yo = (otw['i'] + 0.5) * s.dx, (otw['j'] + 0.5) * s.dy
+            ax.plot([xo, xo], [yo, yo], [z_dol, z_gora], color='black', linewidth=1.5)
+            ax.text(xo, yo, z_gora, otw['nazwa'], fontsize=8)
+        tytul = ax.set_title('')
+        formatuj_osie_pl(fig)
+        powierzchnia = None
+        for indeks, czas in zip(indeksy, czasy):
+            if powierzchnia is not None:
+                powierzchnia.remove()
+            powierzchnia = ax.plot_surface(X, Y, s.historia_cisnien_3d[indeks].T, cmap='plasma',
+                                           vmin=p_min, vmax=p_max, rstride=krok, cstride=krok,
+                                           linewidth=0, antialiased=False)
+            tytul.set_text(f"Lej depresyjny, dzień {liczba_pl(czas, format_dnia)}")
+            bufor = io.BytesIO()
+            fig.savefig(bufor, format='png', dpi=dpi)
+            klatki.append(bufor.getvalue())
+        plt.close(fig)
+    return klatki
+
+
+def odtwarzacz_html(klatki, opisy):
+    """Prosty odtwarzacz klatek w HTML/JS: start, pauza, krokowanie, suwak, tempo, pętla.
+
+    Całość działa w przeglądarce, więc odtwarzanie nie uruchamia ponownie
+    skryptu Streamlita i nie obciąża serwera.
+    """
+    obrazy = json.dumps(["data:image/png;base64," + base64.b64encode(k).decode('ascii')
+                         for k in klatki])
+    podpisy = json.dumps(opisy, ensure_ascii=False)
+    ostatnia = len(klatki) - 1
+    return f"""
+<div style="font-family: sans-serif; background: white; padding: 8px; border-radius: 6px;
+            max-width: 640px; margin: 0 auto; color: #222;">
+  <img id="obraz" style="width: 100%; display: block;">
+  <input id="suwak" type="range" min="0" max="{ostatnia}" value="0" style="width: 100%;">
+  <div style="display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 14px;">
+    <button id="pierwsza" title="Pierwsza klatka">&#9198;</button>
+    <button id="wstecz" title="Poprzednia klatka">&#9664;</button>
+    <button id="start">&#9654; Odtwórz</button>
+    <button id="pauza">&#10073;&#10073; Pauza</button>
+    <button id="dalej" title="Następna klatka">&#9654;</button>
+    <button id="ostatnia" title="Ostatnia klatka">&#9197;</button>
+    <label>Tempo
+      <select id="szybkosc">
+        <option value="2">wolno</option>
+        <option value="6" selected>normalnie</option>
+        <option value="12">szybko</option>
+        <option value="25">bardzo szybko</option>
+      </select>
+    </label>
+    <label><input id="petla" type="checkbox" checked> pętla</label>
+    <span id="opis" style="margin-left: auto;"></span>
+  </div>
+</div>
+<script>
+  const obrazy = {obrazy};
+  const podpisy = {podpisy};
+  let biezaca = 0, licznik = null;
+  const el = (id) => document.getElementById(id);
+  function pokaz(n) {{
+    biezaca = Math.max(0, Math.min(obrazy.length - 1, n));
+    el('obraz').src = obrazy[biezaca];
+    el('suwak').value = biezaca;
+    el('opis').textContent = podpisy[biezaca] + ' (klatka ' + (biezaca + 1) + '/' + obrazy.length + ')';
+  }}
+  function zatrzymaj() {{ if (licznik) {{ clearInterval(licznik); licznik = null; }} }}
+  function odtwarzaj() {{
+    zatrzymaj();
+    if (biezaca >= obrazy.length - 1) pokaz(0);
+    licznik = setInterval(() => {{
+      if (biezaca >= obrazy.length - 1) {{
+        if (el('petla').checked) pokaz(0); else zatrzymaj();
+      }} else pokaz(biezaca + 1);
+    }}, 1000 / parseFloat(el('szybkosc').value));
+  }}
+  el('start').onclick = odtwarzaj;
+  el('pauza').onclick = zatrzymaj;
+  el('pierwsza').onclick = () => {{ zatrzymaj(); pokaz(0); }};
+  el('ostatnia').onclick = () => {{ zatrzymaj(); pokaz(obrazy.length - 1); }};
+  el('wstecz').onclick = () => {{ zatrzymaj(); pokaz(biezaca - 1); }};
+  el('dalej').onclick = () => {{ zatrzymaj(); pokaz(biezaca + 1); }};
+  el('suwak').oninput = (e) => {{ zatrzymaj(); pokaz(parseInt(e.target.value)); }};
+  el('szybkosc').onchange = () => {{ if (licznik) odtwarzaj(); }};
+  pokaz(0);
+</script>
+"""
+
+
+def gif_z_klatek(klatki, fps=6):
+    """Składa klatki PNG w zapętlony plik GIF do pobrania."""
+    from PIL import Image
+    obrazy = [Image.open(io.BytesIO(k)).convert('RGB').convert('P', palette=Image.ADAPTIVE)
+              for k in klatki]
+    bufor = io.BytesIO()
+    obrazy[0].save(bufor, format='GIF', save_all=True, append_images=obrazy[1:],
+                   duration=int(1000 / fps), loop=0)
+    return bufor.getvalue()
 
 
 st.set_page_config(page_title="Symulator przepływu gazu (FVM + HU)", layout="wide")
@@ -393,15 +556,77 @@ if zakladka == ZAKLADKI[0]:
             skala_log=True), "Mapa przepuszczalności", przycinaj=False)
 
 if zakladka == ZAKLADKI[1]:
+    p_min_historii = float(min(x.min() for x in s.historia_cisnien_3d))
+    p_max_historii = float(s.historia_cisnien_3d[0].max())
+
+    # Czas każdego zapisu pola ciśnień; zapis 0 to stan początkowy (dzień 0).
+    interwal = getattr(s, 'interwal_zapisu', 1)
+    czasy_zapisu = [0.0] + [float(s.historia_czasu[n * interwal - 1])
+                            for n in range(1, len(s.historia_cisnien_3d))]
+    t_koniec = czasy_zapisu[-1]
+
+    st.markdown("**Animacja zmian ciśnienia w czasie**")
+    od_dnia, do_dnia = st.slider(
+        "Zakres animacji [doba]", 0.0, float(t_koniec), (0.0, float(t_koniec)),
+        step=float(cfg_w.dt_dni),
+        help="Dzień 0 to stan początkowy, przed uruchomieniem odwiertów. "
+             "Animacja obejmuje zapisy pola ciśnień z wybranego przedziału.")
+    kol_a, kol_b = st.columns(2)
+    liczba_klatek = int(kol_a.number_input(
+        "Liczba klatek", 10, 200, 60, 10,
+        help="Przy długiej symulacji klatki wybierane są równomiernie z zakresu. "
+             "Więcej klatek to płynniejsza animacja, ale dłuższe przygotowanie."))
+    rodzaj = kol_b.radio("Rodzaj animacji", ["Mapa ciśnienia (2D)", "Lej depresyjny (3D)"],
+                         horizontal=True, key="rodzaj_animacji")
+    animacja_3d = rodzaj == "Lej depresyjny (3D)"
+    elewacja, azymut = 30, -60
+    if animacja_3d:
+        kol_c, kol_d = st.columns(2)
+        elewacja = kol_c.slider("Wysokość kamery [°]", 5, 90, 30, 5,
+                                help="90° to widok z góry, małe wartości - widok z boku.")
+        azymut = kol_d.slider("Obrót kamery [°]", -180, 180, -60, 15)
+
+    klucz_animacji = (wid, od_dnia, do_dnia, liczba_klatek, rodzaj, elewacja, azymut)
+    if st.button("Utwórz animację"):
+        w_zakresie = [n for n, t in enumerate(czasy_zapisu) if od_dnia - 1e-9 <= t <= do_dnia + 1e-9]
+        if len(w_zakresie) < 2:
+            st.warning("W wybranym zakresie są mniej niż dwa zapisy pola ciśnień - "
+                       "rozszerz zakres animacji.")
+        else:
+            wybor = np.unique(np.round(np.linspace(
+                0, len(w_zakresie) - 1, min(liczba_klatek, len(w_zakresie)))).astype(int))
+            indeksy = [w_zakresie[n] for n in wybor]
+            czasy = [czasy_zapisu[n] for n in indeksy]
+            with st.spinner(f"Przygotowanie {len(indeksy)} klatek..."):
+                if animacja_3d:
+                    klatki = klatki_animacji_3d(s, indeksy, czasy, p_min_historii,
+                                                p_max_historii, elewacja, azymut)
+                else:
+                    klatki = klatki_animacji(s, indeksy, czasy, p_min_historii, p_max_historii)
+                format_dnia = '.0f' if all(abs(t - round(t)) < 1e-9 for t in czasy) else '.1f'
+                opisy = [f"dzień {liczba_pl(t, format_dnia)}" for t in czasy]
+                st.session_state.animacja = {
+                    'klucz': klucz_animacji,
+                    'html': odtwarzacz_html(klatki, opisy),
+                    'gif': gif_z_klatek(klatki),
+                    'plik': 'animacja_leja_3d.gif' if animacja_3d else 'animacja_cisnienia.gif'}
+
+    animacja = st.session_state.get('animacja')
+    if animacja is not None and animacja['klucz'][0] == wid:
+        if animacja['klucz'] != klucz_animacji:
+            st.caption("Ustawienia zmieniły się od utworzenia animacji - kliknij "
+                       "„Utwórz animację”, aby ją odświeżyć.")
+        components.html(animacja['html'], height=700 if animacja['plik'].endswith('3d.gif') else 650)
+        st.download_button("Pobierz animację (GIF)", animacja['gif'], animacja['plik'], "image/gif")
+
+    st.markdown("---")
+    st.markdown("**Wybrany krok czasowy**")
     klatka = st.slider("Krok czasowy", 0, len(s.historia_cisnien_3d) - 1,
                        len(s.historia_cisnien_3d) - 1,
                        format="Krok %d")
     p_klatka = s.historia_cisnien_3d[klatka]
-    czas_klatki = 0.0 if klatka == 0 else s.historia_czasu[klatka - 1]
-    st.caption(f"Czas: {czas_klatki:.1f} dnia")
-
-    p_min_historii = float(min(x.min() for x in s.historia_cisnien_3d))
-    p_max_historii = float(s.historia_cisnien_3d[0].max())
+    czas_klatki = czasy_zapisu[klatka]
+    st.caption(f"Czas: {liczba_pl(czas_klatki, '.1f')} dnia")
 
     def rysuj_mape_cisnien():
         # Transpozycja: pierwszy indeks tablicy to oś X, która ma być pozioma
@@ -567,11 +792,34 @@ przeciekiem informacji, bo FZI jest funkcją k.
         kol2.metric("RMSE (dla log k) - model HU",
                     f"{liczba_pl(w['rmse_hu'])} ± {liczba_pl(w['rmse_hu_odch'])}",
                     help="Średnia z losowań ± odchylenie standardowe.")
-        kol3.metric("Poprawa dzięki HU", f"{liczba_pl(w['poprawa_proc'], '+.1f')} %")
+        kol3.metric("Poprawa dzięki HU", f"{liczba_pl(w['poprawa_proc'], '+.1f')} %",
+                    help="Względne zmniejszenie błędu RMSE (dla log k) modelu HU względem "
+                         "modelu globalnego: (RMSE glob. − RMSE HU) / RMSE glob. × 100 %.")
         st.caption(f"Trafność klasyfikacji jednostek: "
                    f"{liczba_pl(w['trafnosc_klasyfikacji'] * 100, '.1f')} %. "
                    f"Próbka treningowa: {w['n_treningowych']} komórek, "
                    f"{w['powtorzenia']} powtórzeń losowania.")
+        with st.expander("Jak liczona jest poprawa?"):
+            r_g, r_h = w['rmse_globalna'], w['rmse_hu']
+            st.markdown(f"""
+1. Komórki złoża dzielone są losowo na próbkę treningową (udające rdzenie,
+   {w['n_treningowych']} komórek) i testową (pozostałe komórki).
+2. Na próbce treningowej dopasowywane są dwa modele: **globalny** - jedna zależność
+   *k*(*φ*) dla całego złoża - oraz **HU** - osobna zależność w każdej jednostce.
+   Jednostkę komórki testowej przewiduje klasyfikator k-NN z porowatości i położenia.
+3. Dla komórek testowych liczony jest błąd średniokwadratowy w skali logarytmicznej:
+   RMSE = √( średnia z (log₁₀ *k*<sub>estymowane</sub> − log₁₀ *k*<sub>zmierzone</sub>)² ).
+4. Losowanie powtarzane jest {w['powtorzenia']} razy, a wyniki uśredniane.
+5. Poprawa = (RMSE<sub>glob.</sub> − RMSE<sub>HU</sub>) / RMSE<sub>glob.</sub> × 100 % =
+   ({liczba_pl(r_g, '.3f')} − {liczba_pl(r_h, '.3f')}) / {liczba_pl(r_g, '.3f')} × 100 % =
+   **{liczba_pl(w['poprawa_proc'], '+.1f')} %**.
+
+**Interpretacja.** RMSE liczone jest na logarytmach, więc 10<sup>RMSE</sup> to typowy
+mnożnik błędu estymacji przepuszczalności: model globalny myli się średnio
+{liczba_pl(10 ** r_g, '.1f')}-krotnie, a model HU {liczba_pl(10 ** r_h, '.1f')}-krotnie.
+Wartość dodatnia oznacza, że podział na jednostki hydrauliczne poprawia estymację,
+ujemna - że ją pogarsza.
+""", unsafe_allow_html=True)
         if 'przyklad' in w:
             klucz_rys = ('walidacja', plik.name, cfg_w.liczba_hu)
             kol_a, kol_b = st.columns(2)
@@ -655,3 +903,10 @@ if zakladka == ZAKLADKI[5]:
                  'stopien_sczerpania_proc': s.wspolczynnik_sczerpania(),
                  'blad_bilansu_masy': bilans['blad_wzgledny'],
                  'odwierty': [{k: v for k, v in o.items() if k != 'q_last'} for o in s.odwierty]}
+    st.download_button("Parametry i wyniki (JSON)",
+                       json.dumps(parametry, ensure_ascii=False, indent=2,
+                                  default=lambda o: o.tolist() if hasattr(o, 'tolist') else str(o)),
+                       "parametry_symulacji.json", "application/json")
+    with st.expander("Podgląd parametrów symulacji"):
+        st.json(json.loads(json.dumps(parametry, default=lambda o: o.tolist()
+                                      if hasattr(o, 'tolist') else str(o))))
