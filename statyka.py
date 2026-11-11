@@ -37,6 +37,13 @@ drugi to oś Y. Domyślnie przyjmuje się, że w pliku CSV najszybciej zmienia s
 współrzędna Y (czyli wiersze idą: x0y0, x0y1, ... x0y_n, x1y0, ...). Jeżeli
 plik zawiera kolumny I/J albo x/y, kolejność jest odtwarzana z nich i parametr
 kolejnosci jest ignorowany.
+
+BLOKI BEZ RDZENI: puste pole przepuszczalności w pliku oznacza blok, w którym
+k nie zmierzono. Porowatość musi być podana wszędzie (odpowiada karotażowi).
+Brakującą przepuszczalność uzupełnia metoda uzupelnij_przepuszczalnosc:
+jednostki i korelacje wyznacza się wyłącznie z bloków z rdzeniami, a blokom
+bez rdzeni jednostkę przypisuje klasyfikator k najbliższych sąsiadów
+z porowatości i położenia - tak samo jak w walidacji krzyżowej.
 """
 import threading
 
@@ -46,6 +53,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from sklearn.neighbors import KNeighborsClassifier
 
 KOLORY_HU = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
              '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
@@ -280,7 +288,12 @@ class ModelStatycznyZloza:
 
         self.phi = None
         self.k_mD = None             # pole używane przez symulator
-        self.k_mD_surowe = None      # pole wejściowe, nigdy nie nadpisywane
+        self.k_mD_surowe = None      # pole wejściowe, nigdy nie nadpisywane (NaN = brak rdzenia)
+        self.maska_rdzeni = None     # True tam, gdzie plik podaje przepuszczalność
+        self.kompletne_k = True      # czy przepuszczalność znana jest we wszystkich blokach
+        self.maska_uzyta = None      # bloki, z których zbudowano bieżący model k
+        self.metoda_k = 'pomiary'    # 'pomiary', 'hu', 'globalna' albo 'hu_wszystkie'
+        self.model_globalny = None
         self.hu_grid = None
 
         self.rqi = None
@@ -298,6 +311,11 @@ class ModelStatycznyZloza:
         Wczytuje pole phi i k z ramki danych. W odróżnieniu od wcześniejszej
         wersji nie uzupełnia ani nie ucina po cichu brakujących wierszy -
         niezgodna liczba komórek kończy się wyjątkiem.
+
+        Puste pole przepuszczalności oznacza blok bez rdzenia. Plik z lukami
+        dostaje od razu kompletne pole k_mD (z jednej korelacji k(phi)
+        dopasowanej do rdzeni), żeby obiekt nadawał się do symulacji;
+        właściwy wybór metody należy do uzupelnij_przepuszczalnosc.
         """
         brakujace = [c for c in (kolumna_phi, kolumna_k) if c not in df.columns]
         if brakujace:
@@ -332,11 +350,18 @@ class ModelStatycznyZloza:
                 f"Siatka {self.nx}x{self.ny} = {self.nx * self.ny} komórek wyznaczona na podstawie "
                 f"{zrodlo} nie zgadza się z liczbą wierszy w pliku ({len(df)}).")
 
-        dane_phi = df[kolumna_phi].to_numpy(dtype=float)
-        dane_k = df[kolumna_k].to_numpy(dtype=float)
+        dane_phi = pd.to_numeric(df[kolumna_phi], errors='coerce').to_numpy(dtype=float)
+        dane_k = pd.to_numeric(df[kolumna_k], errors='coerce').to_numpy(dtype=float)
 
-        if not np.all(np.isfinite(dane_phi)) or not np.all(np.isfinite(dane_k)):
-            raise ValueError("Plik zawiera wartości puste lub nieskończone w kolumnach phi lub k.")
+        if not np.all(np.isfinite(dane_phi)):
+            raise ValueError("Porowatość musi być podana we wszystkich blokach - plik zawiera "
+                             "w tej kolumnie wartości puste lub nieliczbowe.")
+        if np.any(np.isinf(dane_k)):
+            raise ValueError("Kolumna przepuszczalności zawiera wartości nieskończone.")
+        znane = np.isfinite(dane_k)
+        if znane.sum() < 3:
+            raise ValueError("Przepuszczalność podano w mniej niż trzech blokach - to za mało, "
+                             "żeby dopasować jakąkolwiek korelację k(phi).")
 
         if np.median(dane_phi) > 1.0:
             dane_phi = dane_phi / 100.0
@@ -344,7 +369,7 @@ class ModelStatycznyZloza:
                 "Porowatość wyglądała na podaną w procentach i została podzielona przez 100.")
 
         n_phi = int(np.sum((dane_phi < PHI_MIN) | (dane_phi > PHI_MAX)))
-        n_k = int(np.sum(dane_k < K_MIN))
+        n_k = int(np.sum(dane_k[znane] < K_MIN))
         if n_phi:
             self.ostrzezenia.append(
                 f"{n_phi} wartości porowatości było poza zakresem {PHI_MIN}-{PHI_MAX} i zostało przyciętych.")
@@ -353,7 +378,7 @@ class ModelStatycznyZloza:
                 f"{n_k} wartości przepuszczalności było poniżej {K_MIN} mD i zostało podniesionych do tej wartości.")
 
         dane_phi = np.clip(dane_phi, PHI_MIN, PHI_MAX)
-        dane_k = np.maximum(dane_k, K_MIN)
+        dane_k = np.where(znane, np.maximum(dane_k, K_MIN), np.nan)
 
         if kol_i is not None and kol_j is not None:
             ksztalt_order = 'C'                     # po sortowaniu J zmienia się najszybciej
@@ -362,36 +387,166 @@ class ModelStatycznyZloza:
 
         self.phi = dane_phi.reshape((self.nx, self.ny), order=ksztalt_order)
         self.k_mD_surowe = dane_k.reshape((self.nx, self.ny), order=ksztalt_order)
-        self.k_mD = self.k_mD_surowe.copy()
+        self.maska_rdzeni = np.isfinite(self.k_mD_surowe)
+        self.kompletne_k = bool(self.maska_rdzeni.all())
         self.liczba_komorek = self.nx * self.ny
 
         self.hu_grid = None
         self.modele_regresji = {}
         self.rqi = self.phi_z = self.fzi = None
+        if self.kompletne_k:
+            self.k_mD = self.k_mD_surowe.copy()
+            self.metoda_k, self.maska_uzyta, self.model_globalny = 'pomiary', None, None
+        else:
+            self.uzupelnij_przepuszczalnosc('globalna')
         return self.nx, self.ny
 
     def przywroc_surowa_przepuszczalnosc(self):
-        """Cofa korektę HU, nie dotykając wyznaczonych jednostek."""
+        """Wraca do przepuszczalności zmierzonej (wymaga pomiaru we wszystkich blokach)."""
+        if not self.kompletne_k:
+            raise ValueError("Plik nie podaje przepuszczalności we wszystkich blokach - "
+                             "brakujące wartości trzeba oszacować (uzupelnij_przepuszczalnosc).")
         self.k_mD = self.k_mD_surowe.copy()
+        self.metoda_k, self.maska_uzyta = 'pomiary', None
         return self.k_mD
 
     def _sprawdz_dane(self):
         if self.phi is None or self.k_mD_surowe is None:
             raise RuntimeError("Najpierw wczytaj dane złoża.")
 
-    def diagnostyka_liczby_jednostek(self, max_k=10, m=1.0, random_state=42):
+    def _cechy_polozenia(self, uzyj_wspolrzednych=True):
+        """
+        Predyktory jednostki dostępne w każdym bloku, także bez rdzenia:
+        porowatość i (opcjonalnie) położenie, standaryzowane po całym złożu.
+        """
+        phi = self.phi.ravel()
+        cechy = [(phi - phi.mean()) / phi.std()]
+        if uzyj_wspolrzednych:
+            ii, jj = np.indices((self.nx, self.ny))
+            cechy += [(ii.ravel() - ii.mean()) / ii.std(), (jj.ravel() - jj.mean()) / jj.std()]
+        return np.column_stack(cechy)
+
+    def losuj_maske_rdzeni(self, udzial, ziarno=1, bloki=()):
+        """
+        Symulacja opróbowania na złożu o znanej przepuszczalności: zwraca
+        maskę bloków, w których k pozostaje znane - losowy udział wszystkich
+        bloków oraz bloki podane jawnie (np. bloki z odwiertami, jako pary
+        (i, j)). Ta sama wartość ziarna zawsze daje ten sam wybór.
+        """
+        self._sprawdz_dane()
+        n = self.liczba_komorek
+        ile = int(round(float(udzial) * n))
+        maska = np.zeros(n, dtype=bool)
+        maska[np.random.default_rng(int(ziarno)).permutation(n)[:ile]] = True
+        maska = maska.reshape((self.nx, self.ny))
+        for i, j in bloki:
+            maska[int(i), int(j)] = True
+        return maska & self.maska_rdzeni
+
+    def uzupelnij_przepuszczalnosc(self, metoda='hu', liczba_hu=4, m=1.0, maska_rdzeni=None,
+                                   liczba_sasiadow=5, uzyj_wspolrzednych=True, random_state=42):
+        """
+        Pole przepuszczalności dla symulatora w sytuacji odpowiadającej
+        praktyce: k znane tylko w blokach z rdzeniami, porowatość wszędzie.
+
+        maska_rdzeni wskazuje bloki, których przepuszczalność wolno użyć.
+        Domyślnie są to bloki z pomiarem w pliku; przy pliku kompletnym można
+        podać mniejszą maskę (losuj_maske_rdzeni) i sprawdzić, jak dobrze
+        model odtwarza ukrytą resztę.
+
+        metoda = 'globalna': jedna korelacja k(phi) dopasowana do rdzeni.
+        metoda = 'hu': jednostki wyznaczone algorytmem k-średnich na log FZI
+            rdzeni (numeracja rosnąco według FZI), korelacje osobno w każdej
+            jednostce; bloki bez rdzenia dostają jednostkę od klasyfikatora
+            k najbliższych sąsiadów (porowatość i położenie), a przepuszczalność
+            z korelacji tej jednostki. Jednostka z mniej niż trzema rdzeniami
+            korzysta z korelacji globalnej.
+
+        W blokach z rdzeniami zawsze zostaje wartość zmierzona. Przepuszczalność
+        bloków spoza maski nie wpływa na wynik (brak przecieku informacji).
+        """
+        self._sprawdz_dane()
+        znane = self.maska_rdzeni if maska_rdzeni is None else \
+            (np.asarray(maska_rdzeni, dtype=bool) & self.maska_rdzeni)
+        r = znane.ravel()
+        n_r = int(r.sum())
+        if n_r < 3:
+            raise ValueError(f"Za mało bloków z rdzeniami ({n_r}) - potrzebne są co najmniej trzy.")
+
+        phi = self.phi.ravel()
+        k = self.k_mD_surowe.ravel()
+        model_g = _dopasuj_w_skali_log(phi[r], k[r])
+        model_g['n'] = n_r
+        self.model_globalny = model_g
+
+        if metoda == 'globalna':
+            k_est = przewidz_k(model_g, phi)
+            self.hu_grid = None
+            self.modele_regresji = {}
+            self.liczba_hu = 0
+            self.rqi = self.phi_z = self.fzi = None
+        elif metoda == 'hu':
+            liczba_hu = int(liczba_hu)
+            if n_r < liczba_hu:
+                raise ValueError(f"Bloków z rdzeniami ({n_r}) jest mniej niż jednostek ({liczba_hu}).")
+            rqi, phi_z, fzi = oblicz_fzi(phi, np.where(r, k, 1.0), m)
+            log_fzi = np.log10(np.maximum(fzi[r], 1e-8)).reshape(-1, 1)
+            km = KMeans(n_clusters=liczba_hu, n_init=10, random_state=random_state).fit(log_fzi)
+            ranga = np.empty(liczba_hu, dtype=int)
+            ranga[np.argsort(km.cluster_centers_.ravel())] = np.arange(1, liczba_hu + 1)
+            etykiety_r = ranga[km.labels_]
+
+            etykiety = np.zeros(len(phi), dtype=int)
+            etykiety[r] = etykiety_r
+            if (~r).any():
+                X = self._cechy_polozenia(uzyj_wspolrzednych)
+                knn = KNeighborsClassifier(n_neighbors=min(int(liczba_sasiadow), n_r))
+                etykiety[~r] = knn.fit(X[r], etykiety_r).predict(X[~r])
+
+            k_est = np.empty(len(phi))
+            self.modele_regresji = {}
+            for c in range(1, liczba_hu + 1):
+                m_r = r & (etykiety == c)
+                m_all = etykiety == c
+                model = (_dopasuj_w_skali_log(phi[m_r], k[m_r]) if m_r.sum() >= 3
+                         else dict(model_g))
+                model['n'] = int(m_r.sum())
+                model['n_blokow'] = int(m_all.sum())
+                self.modele_regresji[c] = model
+                k_est[m_all] = przewidz_k(model, phi[m_all])
+
+            self.liczba_hu, self.m = liczba_hu, float(m)
+            self.hu_grid = etykiety.reshape((self.nx, self.ny))
+            bez = ~r
+            self.rqi = np.where(bez, np.nan, rqi).reshape((self.nx, self.ny))
+            self.phi_z = phi_z.reshape((self.nx, self.ny))
+            self.fzi = np.where(bez, np.nan, fzi).reshape((self.nx, self.ny))
+        else:
+            raise ValueError(f"Nieznana metoda uzupełniania przepuszczalności: {metoda}")
+
+        k_pole = np.maximum(k_est, K_MIN)
+        k_pole[r] = k[r]
+        self.k_mD = k_pole.reshape((self.nx, self.ny))
+        self.maska_uzyta = znane.copy()
+        self.metoda_k = metoda
+        return self.k_mD
+
+    def diagnostyka_liczby_jednostek(self, max_k=10, m=1.0, random_state=42, maska=None):
         """
         Dane do metody łokcia: dla k = 1 ... max_k dzieli log10(FZI_m) metodą
         K-Means i zapisuje inercję (WCSS, suma kwadratów odległości punktów od
         środków klastrów) oraz dystorsję (inercja podzielona przez liczbę
         punktów - miara domyślna w KElbowVisualizer z pakietu Yellowbrick).
 
+        Liczone wyłącznie na blokach ze znaną przepuszczalnością (opcjonalnie
+        zawężonych maską bloków z rdzeniami).
+
         Zwraca ramkę danych z kolumnami k, inercja, dystorsja.
         """
         self._sprawdz_dane()
-        x = self._cechy_do_klastrowania(m)
+        x = self._cechy_do_klastrowania(m, maska)
         wiersze = []
-        for k in range(1, int(max_k) + 1):
+        for k in range(1, min(int(max_k), len(x) - 1) + 1):
             km = KMeans(n_clusters=k, random_state=random_state, n_init=10).fit(x)
             wiersze.append({'k': k,
                             'inercja': float(km.inertia_),
@@ -462,13 +617,25 @@ class ModelStatycznyZloza:
                 'dystorsji wyraźnie się załamuje, czyli dalsze dzielenie zbioru przestaje '
                 'istotnie poprawiać zwartość klastrów.')}
 
-    def _cechy_do_klastrowania(self, m):
-        _, _, fzi = oblicz_fzi(self.phi.ravel(), self.k_mD_surowe.ravel(), m)
+    def _cechy_do_klastrowania(self, m, maska=None):
+        """log10(FZI_m) bloków ze znaną przepuszczalnością (opcjonalnie tylko z maski)."""
+        znane = self.maska_rdzeni if maska is None else (np.asarray(maska, dtype=bool) & self.maska_rdzeni)
+        r = znane.ravel()
+        _, _, fzi = oblicz_fzi(self.phi.ravel()[r], self.k_mD_surowe.ravel()[r], m)
         return np.log10(np.maximum(fzi, 1e-8)).reshape(-1, 1)
 
     # ---------------------------------------------- jednostki hydrauliczne
     def wyznacz_jednostki_hu(self, liczba_hu=4, m=1.0, random_state=42):
+        """
+        Podział WSZYSTKICH bloków na jednostki z ich własnej przepuszczalności.
+        Wymaga pomiaru k w każdym bloku i służy do opisu złoża wzorcowego
+        (oraz testów). Do szacowania k w blokach bez rdzeni służy
+        uzupelnij_przepuszczalnosc.
+        """
         self._sprawdz_dane()
+        if not self.kompletne_k:
+            raise ValueError("Podział wszystkich bloków wymaga przepuszczalności w każdym bloku - "
+                             "dla pliku z lukami użyj uzupelnij_przepuszczalnosc.")
         self.liczba_hu = int(liczba_hu)
         self.m = float(m)
 
@@ -511,6 +678,7 @@ class ModelStatycznyZloza:
             nowe_k[maska] = przewidz_k(model, phi_d)
 
         self.k_mD = np.maximum(nowe_k, K_MIN)
+        self.metoda_k, self.maska_uzyta = 'hu_wszystkie', None
         return self.k_mD
 
     def diagnostyka_wykladnika_m(self, liczba_hu=4, m_min=1.0, m_max=3.0, krok=0.05,
@@ -675,23 +843,21 @@ class ModelStatycznyZloza:
         znanych poza rdzeniem: porowatości i opcjonalnie położenia, które
         odpowiada informacji z modelu geologicznego lub sejsmiki.
 
+        Gdy plik podaje k tylko w części bloków, test obejmuje wyłącznie bloki
+        z rdzeniami: część z nich jest treningowa, a reszta testowa.
+
         Zwraca RMSE log10(k) obu podejść. Metoda nie zmienia stanu obiektu.
         """
-        from sklearn.neighbors import KNeighborsClassifier
-
         self._sprawdz_dane()
-        phi = self.phi.ravel()
-        k = self.k_mD_surowe.ravel()
+        znane = self.maska_rdzeni.ravel()
+        phi = self.phi.ravel()[znane]
+        k = self.k_mD_surowe.ravel()[znane]
         log_k = np.log10(k)
         _, _, fzi = oblicz_fzi(phi, k, m)
         log_fzi = np.log10(np.maximum(fzi, 1e-8)).reshape(-1, 1)
 
-        # Predyktory dostępne poza rdzeniem (bez udziału k)
-        cechy = [(phi - phi.mean()) / phi.std()]
-        if uzyj_wspolrzednych:
-            ii, jj = np.indices((self.nx, self.ny))
-            cechy += [(ii.ravel() - ii.mean()) / ii.std(), (jj.ravel() - jj.mean()) / jj.std()]
-        X = np.column_stack(cechy)
+        # Predyktory dostępne poza rdzeniem (bez udziału k), standaryzowane po całym złożu
+        X = self._cechy_polozenia(uzyj_wspolrzednych)[znane]
 
         n = len(phi)
         n_tren = max(5 * int(liczba_hu), int(round(udzial_treningowy * n)))
@@ -875,12 +1041,26 @@ class ModelStatycznyZloza:
         return znalezione
 
     # --------------------------------------------------------------- wykresy
+    def _serie_korelacji(self):
+        """
+        Pary (opis, maska punktów, model) do wykresu i tabeli korelacji.
+        Punkty to wyłącznie bloki, na których dopasowano korelację.
+        """
+        znane = self.maska_uzyta if self.maska_uzyta is not None else self.maska_rdzeni
+        if self.metoda_k == 'globalna' and self.model_globalny is not None:
+            return [('Całe złoże', znane, self.model_globalny)]
+        if self.hu_grid is None or not self.modele_regresji:
+            return []
+        return [(f"HU {hu_id}", (self.hu_grid == hu_id) & znane, self.modele_regresji[hu_id])
+                for hu_id in sorted(self.modele_regresji)]
+
     def generuj_tabele_rownan(self):
-        if not self.modele_regresji:
+        serie = self._serie_korelacji()
+        if not serie:
             return None
+        z_rdzeni = self.metoda_k in ('hu', 'globalna')
         wiersze = []
-        for hu_id in sorted(self.modele_regresji):
-            mod = self.modele_regresji[hu_id]
+        for nazwa, maska, mod in serie:
             if mod['typ'] == 'exp':
                 a, b = mod['popt']
                 rownanie = (f"<i>k</i> = {liczba_pl(a, '.4g')}·e<sup>{liczba_pl(b)}"
@@ -890,40 +1070,56 @@ class ModelStatycznyZloza:
                 rownanie = f"<i>k</i> = {liczba_pl(a, '.4g')}·<i>φ</i><sup>{liczba_pl(b)}</sup>"
             else:
                 rownanie = f"<i>k</i> = {liczba_pl(float(mod['popt'][0]), '.2f')} mD (wartość stała)"
-            wiersze.append({
-                "Jednostka HU": f"HU {hu_id}",
-                "Liczba komórek": mod.get('n', ''),
+            wiersz = {"Jednostka HU" if nazwa.startswith('HU') else "Zakres": nazwa}
+            if z_rdzeni:
+                wiersz["Bloki z rdzeniami"] = int(mod.get('n', maska.sum()))
+                wiersz["Bloki razem"] = int(mod.get('n_blokow', self.liczba_komorek))
+            else:
+                wiersz["Liczba komórek"] = mod.get('n', '')
+            wiersz.update({
                 "Równanie korelacyjne": rownanie,
                 "<i>R</i><sup>2</sup> (dla log <i>k</i>)": liczba_pl(mod['r2'], '.4f'),
                 "RMSE (dla log <i>k</i>)": liczba_pl(mod['rmse_log'], '.4f'),
             })
+            wiersze.append(wiersz)
         return pd.DataFrame(wiersze)
 
     def generuj_figure_diagnostyczna(self):
-        """Wykres k-phi z podziałem na jednostki hydrauliczne i liniami korelacji."""
-        if self.hu_grid is None or not self.modele_regresji:
+        """
+        Wykres k-phi z liniami korelacji: dla modelu HU z podziałem na
+        jednostki, dla jednej korelacji - wspólny dla całego złoża. Punkty to
+        bloki, na których korelacje dopasowano (przy modelu z rdzeni - same
+        rdzenie).
+        """
+        serie = self._serie_korelacji()
+        if not serie:
             raise RuntimeError("Najpierw wyznacz HU i dopasuj korelacje.")
         _styl_wykresu()
         fig, ax = plt.subplots(figsize=(9, 6), dpi=200)
         ax.set_yscale('log')
-        phi_gladkie = np.linspace(self.phi.min(), self.phi.max(), 200)
+        punkty = np.zeros(self.phi.shape, dtype=bool)
+        for _, maska, _ in serie:
+            punkty |= maska
+        phi_gladkie = np.linspace(self.phi[punkty].min(), self.phi[punkty].max(), 200)
 
-        for hu_id in sorted(self.modele_regresji):
-            maska = self.hu_grid == hu_id
-            mod = self.modele_regresji[hu_id]
-            kolor = KOLORY_HU[(hu_id - 1) % len(KOLORY_HU)]
+        for nr, (nazwa, maska, mod) in enumerate(serie):
+            kolor = KOLORY_HU[nr % len(KOLORY_HU)] if nazwa.startswith('HU') else '#1f77b4'
+            opis = nazwa if nazwa.startswith('HU') else 'Jedna korelacja'
             ax.scatter(self.phi[maska], self.k_mD_surowe[maska], color=kolor, alpha=0.7,
                        edgecolors='#333333', linewidths=0.5, s=35, zorder=3,
-                       label=f"HU {hu_id} ($n$ = {mod.get('n', maska.sum())}, "
+                       label=f"{opis} ($n$ = {int(maska.sum())}, "
                              f"$R^2$ = {liczba_pl(mod['r2'])})")
             k_lin = przewidz_k(mod, phi_gladkie)
             widoczne = (k_lin > 1e-3) & (k_lin < 1e5)
             ax.plot(phi_gladkie[widoczne], k_lin[widoczne], color='black', linewidth=0.8, zorder=4)
 
+        tytul = (r'Zależność $k(\phi)$ w obrębie jednostek hydraulicznych'
+                 if serie[0][0].startswith('HU') else r'Jedna korelacja $k(\phi)$ dla całego złoża')
+        if self.metoda_k in ('hu', 'globalna'):
+            tytul += ' (bloki z rdzeniami)'
         ax.set_xlabel(r'Porowatość efektywna, $\phi$ [-]', fontsize=11, fontweight='bold', labelpad=8)
         ax.set_ylabel(r'Przepuszczalność absolutna, $k$ [mD]', fontsize=11, fontweight='bold', labelpad=8)
-        ax.set_title(r'Zależność $k(\phi)$ w obrębie jednostek hydraulicznych', fontsize=12,
-                     fontweight='bold', pad=12)
+        ax.set_title(tytul, fontsize=12, fontweight='bold', pad=12)
         ax.grid(True, which='both', ls='--', color='#d0d0d0', alpha=0.6, zorder=1)
         for s in ax.spines.values():
             s.set_edgecolor('#222222')
@@ -1017,6 +1213,52 @@ class ModelStatycznyZloza:
         fig.tight_layout()
         return formatuj_osie_pl(fig)
 
+    def generuj_mape_rdzeni(self, maska, odwierty=()):
+        """Mapa bloków z rdzeniami (przepuszczalność zmierzona) i bez nich."""
+        from matplotlib.colors import ListedColormap
+        from matplotlib.patches import Patch
+        _styl_wykresu()
+        fig, ax = plt.subplots(figsize=(6.5, 5.5), dpi=150)
+        maska = np.asarray(maska, dtype=bool)
+        ax.imshow(maska.T.astype(float), origin='lower', vmin=0, vmax=1,
+                  cmap=ListedColormap(['#e8e8e8', '#2b5f8a']),
+                  extent=[0, self.nx * self.dx, 0, self.ny * self.dy])
+        for otw in odwierty:
+            ax.plot((otw['i'] + 0.5) * self.dx, (otw['j'] + 0.5) * self.dy, 'o', color='#f08a24',
+                    markersize=8, markeredgecolor='black')
+        uchwyty = [Patch(color='#2b5f8a', label=f"z rdzeniem ({int(maska.sum())})"),
+                   Patch(color='#e8e8e8', label=f"bez rdzenia ({int((~maska).sum())})")]
+        if len(odwierty):
+            uchwyty.append(plt.Line2D([], [], marker='o', ls='', color='#f08a24',
+                                      markeredgecolor='black', label='odwiert'))
+        ax.legend(handles=uchwyty, loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=3,
+                  fontsize=9, frameon=False)
+        ax.set_xlabel(r'Współrzędna $x$ [m]')
+        ax.set_ylabel(r'Współrzędna $y$ [m]')
+        ax.set_title('Bloki z rdzeniami')
+        fig.tight_layout()
+        return formatuj_osie_pl(fig)
+
+    def generuj_mapy_przepuszczalnosci(self, pola, tytuly, odwierty=()):
+        """Kilka pól przepuszczalności obok siebie, ze wspólną skalą barw."""
+        from matplotlib.colors import LogNorm
+        _styl_wykresu()
+        pola = [np.asarray(p, dtype=float) for p in pola]
+        norma = LogNorm(vmin=max(min(p.min() for p in pola), 1e-3), vmax=max(p.max() for p in pola))
+        fig, osie = plt.subplots(1, len(pola), figsize=(5.0 * len(pola) + 1.2, 4.6), dpi=130,
+                                 squeeze=False)
+        for ax, pole, tytul in zip(osie[0], pola, tytuly):
+            obraz = ax.imshow(pole.T, origin='lower', cmap='viridis', norm=norma,
+                              extent=[0, self.nx * self.dx, 0, self.ny * self.dy])
+            for otw in odwierty:
+                ax.plot((otw['i'] + 0.5) * self.dx, (otw['j'] + 0.5) * self.dy, 'wo',
+                        markersize=6, markeredgecolor='black')
+            ax.set_title(tytul, fontsize=11)
+            ax.set_xlabel(r'$x$ [m]')
+            ax.set_ylabel(r'$y$ [m]')
+        fig.colorbar(obraz, ax=list(osie[0]), label=r'Przepuszczalność, $k$ [mD]', shrink=0.85)
+        return formatuj_osie_pl(fig)
+
     def do_ramki(self):
         """Eksport pól statycznych do ramki danych (do załączników pracy)."""
         self._sprawdz_dane()
@@ -1026,8 +1268,10 @@ class ModelStatycznyZloza:
             'x': ((ii.ravel() + 0.5) * self.dx), 'y': ((jj.ravel() + 0.5) * self.dy),
             'Porowatosc': self.phi.ravel(),
             'Przepuszczalnosc': self.k_mD_surowe.ravel(),
-            'Przepuszczalnosc_HU': self.k_mD.ravel(),
+            'Przepuszczalnosc_symulacja': self.k_mD.ravel(),
         }
+        if self.maska_uzyta is not None:
+            dane['Rdzen'] = self.maska_uzyta.ravel().astype(int)
         if self.fzi is not None:
             dane['RQI'] = self.rqi.ravel()
             dane['FZI'] = self.fzi.ravel()
